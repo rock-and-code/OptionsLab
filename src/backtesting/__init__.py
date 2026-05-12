@@ -10,9 +10,15 @@ from src.backtesting.backtest_engine import (
     BacktestResult,
     run_delta_hedge_backtest,
 )
+from src.backtesting.directional_engine import (
+    DirectionalBacktester,
+    rolling_realized_vol,
+)
 
 __all__ = [
     "BacktestEngine",
     "BacktestResult",
+    "DirectionalBacktester",
+    "rolling_realized_vol",
     "run_delta_hedge_backtest",
 ]
