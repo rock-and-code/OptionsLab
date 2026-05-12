@@ -62,6 +62,8 @@ def run_walkforward(
     max_hold_days: int = 10,
     dte_days: int = 30,
     sigma_window: int = 20,
+    sigma_scaled_targets: bool = False,
+    reference_sigma: float = 0.20,
 ) -> pd.DataFrame:
     """
     Evaluate the wizard signal on every (ticker, year) pair in panel_data.
@@ -82,6 +84,8 @@ def run_walkforward(
                 stop_loss_pct=stop_loss_pct,
                 max_hold_days=max_hold_days,
                 dte_days=dte_days,
+                sigma_scaled_targets=sigma_scaled_targets,
+                reference_sigma=reference_sigma,
             )
             r = bt.run(
                 ticker,
@@ -143,6 +147,19 @@ def _print_panel(df: pd.DataFrame) -> None:
         )
 
 
+def _print_summary(label: str, summary: dict) -> None:
+    print(f"  [{label}]")
+    for side, stats in summary.items():
+        print(
+            f"    {side:>4}: "
+            f"pairs={stats['pairs']:>2}, trades={stats['total_trades']:>4}, "
+            f"win={stats['weighted_win_rate'] * 100:>4.1f}%, "
+            f"pnl=${stats['summed_pnl']:>+8.2f}, "
+            f"mean_sharpe={stats['mean_sharpe']:>+5.2f}, "
+            f"pos_pair_pct={stats['positive_pair_pct'] * 100:>4.1f}%"
+        )
+
+
 if __name__ == "__main__":
     tickers = ["SPY", "QQQ", "IWM", "AAPL", "TSLA", "GLD"]
     years = list(range(2019, 2025))
@@ -151,20 +168,25 @@ if __name__ == "__main__":
     panel = fetch_panel(tickers, years)
     print(f"  got {len(panel)} pairs\n")
 
-    print("Running walk-forward (fixed params: stretch=0.08, target=15%, stop=8%, "
-          "max_hold=10, dte=30, sigma=20-day realized)...\n")
-    df = run_walkforward(panel)
-    _print_panel(df)
+    print("A. Fixed-percent targets (15% / 8%)")
+    df_fixed = run_walkforward(panel, sigma_scaled_targets=False)
+    _print_summary("fixed", summarize(df_fixed))
 
-    print()
-    print("Aggregate:")
-    summary = summarize(df)
-    for side, stats in summary.items():
-        print(
-            f"  {side:>4}: "
-            f"pairs={stats['pairs']:>2}, trades={stats['total_trades']:>4}, "
-            f"win={stats['weighted_win_rate'] * 100:>4.1f}%, "
-            f"pnl=${stats['summed_pnl']:>+8.2f}, "
-            f"mean_sharpe={stats['mean_sharpe']:>+5.2f}, "
-            f"pos_pair_pct={stats['positive_pair_pct'] * 100:>4.1f}%"
-        )
+    print("\nB. Sigma-scaled targets (base 15% / 8% at ref sigma=0.20)")
+    df_scaled = run_walkforward(panel, sigma_scaled_targets=True, reference_sigma=0.20)
+    _print_summary("scaled", summarize(df_scaled))
+
+    print("\nPer-pair delta (scaled - fixed), worst and best:")
+    merged = df_fixed.merge(
+        df_scaled,
+        on=["ticker", "year", "side"],
+        suffixes=("_fixed", "_scaled"),
+    )
+    merged["pnl_delta"] = merged["total_pnl_scaled"] - merged["total_pnl_fixed"]
+    merged["sharpe_delta"] = merged["sharpe_scaled"] - merged["sharpe_fixed"]
+    print("  biggest scaled-vs-fixed improvements:")
+    for _, r in merged.sort_values("pnl_delta", ascending=False).head(5).iterrows():
+        print(f"    {r.ticker:<5} {r.year} {r.side:>4}: pnl {r.total_pnl_fixed:+7.2f} -> {r.total_pnl_scaled:+7.2f} ({r.pnl_delta:+6.2f}), sharpe {r.sharpe_fixed:+.2f} -> {r.sharpe_scaled:+.2f}")
+    print("  biggest scaled-vs-fixed regressions:")
+    for _, r in merged.sort_values("pnl_delta").head(5).iterrows():
+        print(f"    {r.ticker:<5} {r.year} {r.side:>4}: pnl {r.total_pnl_fixed:+7.2f} -> {r.total_pnl_scaled:+7.2f} ({r.pnl_delta:+6.2f}), sharpe {r.sharpe_fixed:+.2f} -> {r.sharpe_scaled:+.2f}")

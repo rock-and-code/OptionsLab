@@ -143,6 +143,66 @@ def test_sigma_series_nan_falls_back_to_default():
     assert result.n_trades == 1
 
 
+def test_sigma_scaled_targets_widens_bounds_at_high_vol():
+    """High-sigma entries should get wider effective targets/stops."""
+    # Mild moves so we rely on theta and time rather than spot crossing the bounds.
+    prices = [100.0 + 0.05 * i for i in range(30)]
+    hist = _make_history(prices)
+
+    # Lock sigma high so the position enters with sigma_at_entry = 0.50
+    high_sigma = pd.Series([0.50] * len(prices), index=hist.index)
+
+    # Without scaling: fixed 8% stop, fixed 15% target.
+    unscaled = DirectionalBacktester(
+        profit_target_pct=0.15, stop_loss_pct=0.08, max_hold_days=10,
+        sigma_scaled_targets=False,
+    )
+    r_unscaled = unscaled.run(
+        "T", "2024-01-01", "2024-02-12", _buy_on_first_bar,
+        price_history=hist, sigma_series=high_sigma,
+    )
+
+    # With scaling at reference 0.20: effective stop = 8% * 0.50/0.20 = 20%,
+    # effective target = 15% * 0.50/0.20 = 37.5%. Same path -> exits should
+    # differ; in particular the scaled run will *not* trigger the unscaled
+    # stop level on small adverse moves.
+    scaled = DirectionalBacktester(
+        profit_target_pct=0.15, stop_loss_pct=0.08, max_hold_days=10,
+        sigma_scaled_targets=True, reference_sigma=0.20,
+    )
+    r_scaled = scaled.run(
+        "T", "2024-01-01", "2024-02-12", _buy_on_first_bar,
+        price_history=hist, sigma_series=high_sigma,
+    )
+
+    assert r_unscaled.n_trades >= 1
+    assert r_scaled.n_trades >= 1
+    # Different effective bounds -> different P&L paths on the same input.
+    assert r_unscaled.total_pnl != r_scaled.total_pnl
+
+
+def test_sigma_scaling_collapses_to_unscaled_at_reference_sigma():
+    """When sigma_at_entry == reference_sigma, the scale factor is 1 and
+    scaled mode should be identical to unscaled."""
+    prices = [100.0 + 0.4 * i for i in range(30)]
+    hist = _make_history(prices)
+    sigma = pd.Series([0.20] * len(prices), index=hist.index)
+
+    common = dict(
+        profit_target_pct=0.15, stop_loss_pct=0.08, max_hold_days=10, dte_days=30,
+    )
+    a = DirectionalBacktester(**common, sigma_scaled_targets=False)
+    b = DirectionalBacktester(**common, sigma_scaled_targets=True, reference_sigma=0.20)
+
+    ra = a.run("T", "2024-01-01", "2024-02-12", _buy_on_first_bar,
+               price_history=hist, sigma_series=sigma)
+    rb = b.run("T", "2024-01-01", "2024-02-12", _buy_on_first_bar,
+               price_history=hist, sigma_series=sigma)
+
+    assert ra.total_pnl == pytest.approx(rb.total_pnl, abs=1e-9)
+    assert ra.n_trades == rb.n_trades
+
+
 def test_sigma_series_wrong_length_raises():
     hist = _make_history([100.0] * 10)
     bt = DirectionalBacktester()

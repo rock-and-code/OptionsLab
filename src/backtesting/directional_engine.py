@@ -72,6 +72,8 @@ class DirectionalBacktester:
         stop_loss_pct: float = 0.08,
         dte_days: int = 30,
         max_hold_days: int = 10,
+        sigma_scaled_targets: bool = False,
+        reference_sigma: float = 0.20,
     ):
         self.r = risk_free_rate
         self.sigma = sigma  # constant fallback when no sigma_series is provided
@@ -79,6 +81,15 @@ class DirectionalBacktester:
         self.stop_loss_pct = stop_loss_pct
         self.dte_days = dte_days
         self.max_hold_days = max_hold_days
+        # When True, the profit_target/stop_loss percentages above are
+        # interpreted at reference_sigma and scaled linearly with the
+        # position's entry-time sigma. Rationale: BS expected option-premium
+        # move scales ~linearly with sigma for a given holding period, so
+        # fixed-percent boundaries put TSLA (sigma~0.6) inside one bar's
+        # noise and leave GLD (sigma~0.12) reaching for moves that rarely
+        # come.
+        self.sigma_scaled_targets = sigma_scaled_targets
+        self.reference_sigma = reference_sigma
 
     @staticmethod
     def _fetch_history(ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -134,9 +145,17 @@ class DirectionalBacktester:
         )
         pnl_pct = (current_price - pos.entry_price) / pos.entry_price
 
-        if pnl_pct <= -self.stop_loss_pct:
+        if self.sigma_scaled_targets and self.reference_sigma > 0:
+            scale = pos.sigma_at_entry / self.reference_sigma
+            effective_target = self.profit_target_pct * scale
+            effective_stop = self.stop_loss_pct * scale
+        else:
+            effective_target = self.profit_target_pct
+            effective_stop = self.stop_loss_pct
+
+        if pnl_pct <= -effective_stop:
             return current_price, "stop_loss"
-        if pnl_pct >= self.profit_target_pct:
+        if pnl_pct >= effective_target:
             return current_price, "profit_target"
         if days_held >= self.max_hold_days:
             return current_price, "max_hold"
