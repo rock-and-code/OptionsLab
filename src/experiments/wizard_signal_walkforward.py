@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from src.backtesting import DirectionalBacktester, rolling_realized_vol
-from src.strategies.wizard_signal import make_wizard_signal_fn
+from src.strategies.wizard_signal import DEFAULT_SCORE_THRESHOLD, make_wizard_signal_fn
 
 
 @dataclass
@@ -56,6 +56,7 @@ def run_walkforward(
     panel_data: dict[tuple[str, int], pd.DataFrame],
     *,
     sides: tuple[str, ...] = ("call", "put"),
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD,
     max_stretch_pct: Optional[float] = 0.08,
     profit_target_pct: float = 0.15,
     stop_loss_pct: float = 0.08,
@@ -80,7 +81,11 @@ def run_walkforward(
         underlying_ret = float(hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1)
 
         for side in sides:
-            signal_fn = make_wizard_signal_fn(side, max_stretch_pct=max_stretch_pct)
+            signal_fn = make_wizard_signal_fn(
+                side,
+                score_threshold=score_threshold,
+                max_stretch_pct=max_stretch_pct,
+            )
             bt = DirectionalBacktester(
                 profit_target_pct=profit_target_pct,
                 stop_loss_pct=stop_loss_pct,
@@ -134,6 +139,42 @@ def summarize(panel_df: pd.DataFrame) -> dict:
             "positive_pair_pct": float((slc["total_pnl"] > 0).mean()),
         }
     return out
+
+
+def sweep_score_thresholds(
+    panel_data: dict[tuple[str, int], pd.DataFrame],
+    thresholds: list[float],
+    **bt_kwargs,
+) -> pd.DataFrame:
+    """
+    Run the panel at multiple score thresholds and aggregate by (threshold, side).
+
+    Returns a DataFrame with one row per (threshold, side) summarizing total
+    trades, win rate, total P&L, mean Sharpe, profitable-pair fraction, and
+    P&L per trade — the last is the key statistic for the cost-coverage
+    question (zero-cost edge per trade vs. realistic cost drag per trade).
+    """
+    rows = []
+    for thr in thresholds:
+        df = run_walkforward(panel_data, score_threshold=thr, **bt_kwargs)
+        for side in df["side"].unique():
+            slc = df[df["side"] == side]
+            total_trades = int(slc["n_trades"].sum())
+            wins = int((slc["n_trades"] * slc["win_rate"]).sum())
+            summed_pnl = float(slc["total_pnl"].sum())
+            rows.append(
+                {
+                    "threshold": thr,
+                    "side": side,
+                    "trades": total_trades,
+                    "win_rate": wins / total_trades if total_trades else 0.0,
+                    "total_pnl": summed_pnl,
+                    "pnl_per_trade": summed_pnl / total_trades if total_trades else 0.0,
+                    "mean_sharpe": float(slc["sharpe"].mean()),
+                    "pos_pair_pct": float((slc["total_pnl"] > 0).mean()),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _print_panel(df: pd.DataFrame) -> None:
@@ -201,3 +242,23 @@ if __name__ == "__main__":
     merged["pnl_delta"] = merged["total_pnl_cost"] - merged["total_pnl_nocost"]
     for _, r in merged.sort_values("pnl_delta").head(5).iterrows():
         print(f"    {r.ticker:<5} {r.year} {r.side:>4}: pnl {r.total_pnl_nocost:+7.2f} -> {r.total_pnl_cost:+7.2f} ({r.pnl_delta:+6.2f})")
+
+    # ------------------------------------------------------------------
+    # E. Score-threshold sweep at retail costs. The question: does a
+    # higher-conviction filter (raise threshold -> fewer, better signals)
+    # produce per-trade edge that beats the ~$0.30/trade cost drag?
+    # ------------------------------------------------------------------
+    print("\nE. Score-threshold sweep, RETAIL costs (fixed targets)")
+    thresholds = [0.10, 0.20, 0.25, 0.30, 0.315, 0.35, 0.40, 0.45]
+    sweep = sweep_score_thresholds(panel, thresholds, **RETAIL_COSTS)
+    print(
+        f"  {'thr':>6} {'side':>4} {'trades':>6} {'win%':>5} "
+        f"{'total_pnl':>10} {'$/trade':>8} {'sharpe':>7} {'pos%':>5}"
+    )
+    for _, r in sweep.sort_values(["side", "threshold"]).iterrows():
+        print(
+            f"  {r.threshold:>6.3f} {r.side:>4} {r.trades:>6d} "
+            f"{r.win_rate * 100:>4.1f}% {r.total_pnl:>+10.2f} "
+            f"{r.pnl_per_trade:>+8.3f} {r.mean_sharpe:>+7.2f} "
+            f"{r.pos_pair_pct * 100:>4.1f}%"
+        )

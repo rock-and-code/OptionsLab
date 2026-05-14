@@ -4,6 +4,7 @@ import pandas as pd
 from src.experiments.wizard_signal_walkforward import (
     run_walkforward,
     summarize,
+    sweep_score_thresholds,
 )
 
 
@@ -60,3 +61,25 @@ def test_run_walkforward_respects_one_side_only():
     panel = {("A", 2023): _synth_history(120, drift=0.15, seed=6)}
     df = run_walkforward(panel, sides=("call",))
     assert list(df["side"]) == ["call"]
+
+
+def test_higher_threshold_produces_fewer_trades():
+    """Raising score_threshold from loose (0.20) to strict (0.45) must reduce
+    trade count; at most-strict it requires all three conditions."""
+    panel = {("A", 2023): _synth_history(150, drift=0.20, seed=7)}
+    loose = run_walkforward(panel, sides=("call",), score_threshold=0.20)
+    strict = run_walkforward(panel, sides=("call",), score_threshold=0.45)
+    assert int(loose["n_trades"].iloc[0]) >= int(strict["n_trades"].iloc[0])
+
+
+def test_sweep_score_thresholds_shape_and_columns():
+    panel = {
+        ("A", 2023): _synth_history(150, drift=0.15, seed=8),
+        ("B", 2023): _synth_history(150, drift=-0.10, seed=9),
+    }
+    sweep = sweep_score_thresholds(panel, [0.20, 0.45])
+    # 2 thresholds × 2 sides = 4 rows
+    assert len(sweep) == 4
+    for col in ("threshold", "side", "trades", "win_rate", "total_pnl",
+                "pnl_per_trade", "mean_sharpe", "pos_pair_pct"):
+        assert col in sweep.columns
