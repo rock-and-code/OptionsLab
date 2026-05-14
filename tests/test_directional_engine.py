@@ -203,6 +203,74 @@ def test_sigma_scaling_collapses_to_unscaled_at_reference_sigma():
     assert ra.n_trades == rb.n_trades
 
 
+def test_transaction_costs_reduce_pnl_on_matched_hold_winner():
+    """For trades with matched holding periods (forced max_hold exit), costs
+    reduce a winner's net P&L by approximately 2*hs*premium + 2*commission.
+
+    Note: when profit_target/stop are reachable, costs can *delay* an exit
+    (by suppressing the bid below the threshold) and the resulting longer
+    hold can paradoxically yield more P&L. To isolate the cost impact we
+    set thresholds out of reach so both runs exit on max_hold.
+    """
+    prices = [100.0] + [100.0 + i for i in range(1, 8)]  # strong rally, 8 bars
+    hist = _make_history(prices)
+
+    # Unreachable thresholds -> both exit on max_hold_days=5
+    zero_cost = DirectionalBacktester(
+        profit_target_pct=10.0, stop_loss_pct=10.0, max_hold_days=5,
+    )
+    with_cost = DirectionalBacktester(
+        profit_target_pct=10.0, stop_loss_pct=10.0, max_hold_days=5,
+        bid_ask_spread_pct=0.02, commission_per_contract=0.65,
+    )
+
+    r0 = zero_cost.run("T", "2024-01-01", "2024-01-12", _buy_on_first_bar, price_history=hist)
+    r1 = with_cost.run("T", "2024-01-01", "2024-01-12", _buy_on_first_bar, price_history=hist)
+
+    assert r0.n_trades == 1 and r1.n_trades == 1
+    assert r0.total_pnl > 0
+    assert r1.total_pnl < r0.total_pnl  # costs always reduce a matched-hold winner
+
+
+def test_commission_units_treat_contract_as_100_shares():
+    """commission_per_contract is divided by 100 inside the engine so it
+    lives in the same per-share unit as BS premium. With $0.65/contract
+    and zero spread, a 1-bar held trade should lose roughly 2*$0.65/100
+    = $0.013 in commissions, NOT $1.30."""
+    prices = [100.0, 100.0]  # no spot move
+    hist = _make_history(prices)
+
+    # Force matched 1-bar hold via max_hold_days=1.
+    zero = DirectionalBacktester(
+        profit_target_pct=10.0, stop_loss_pct=10.0, max_hold_days=1,
+    )
+    comm_only = DirectionalBacktester(
+        profit_target_pct=10.0, stop_loss_pct=10.0, max_hold_days=1,
+        commission_per_contract=0.65,
+    )
+
+    r0 = zero.run("T", "2024-01-01", "2024-01-04", _buy_on_first_bar, price_history=hist)
+    r1 = comm_only.run("T", "2024-01-01", "2024-01-04", _buy_on_first_bar, price_history=hist)
+
+    # Round-trip commission cost in per-share units: 2 * 0.65 / 100 = 0.013
+    cost_delta = r0.total_pnl - r1.total_pnl
+    assert 0.010 < cost_delta < 0.020, f"expected ~$0.013, got {cost_delta:.4f}"
+
+
+def test_pnl_invariant_holds_with_transaction_costs():
+    """sum(daily_pnl) must still equal sum(realized trade P&Ls)."""
+    prices = [100.0 + i * 0.3 for i in range(40)]
+    hist = _make_history(prices)
+    bt = DirectionalBacktester(
+        profit_target_pct=0.15, stop_loss_pct=0.08, max_hold_days=5,
+        bid_ask_spread_pct=0.02, commission_per_contract=0.65,
+    )
+    result = bt.run("T", "2024-01-01", "2024-02-26",
+                    lambda h: "buy_call" if len(h) >= 2 else "hold",
+                    price_history=hist)
+    assert abs(sum(result.daily_pnl) - result.total_pnl) < 1e-6
+
+
 def test_sigma_series_wrong_length_raises():
     hist = _make_history([100.0] * 10)
     bt = DirectionalBacktester()

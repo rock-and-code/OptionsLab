@@ -64,6 +64,8 @@ def run_walkforward(
     sigma_window: int = 20,
     sigma_scaled_targets: bool = False,
     reference_sigma: float = 0.20,
+    bid_ask_spread_pct: float = 0.0,
+    commission_per_contract: float = 0.0,
 ) -> pd.DataFrame:
     """
     Evaluate the wizard signal on every (ticker, year) pair in panel_data.
@@ -86,6 +88,8 @@ def run_walkforward(
                 dte_days=dte_days,
                 sigma_scaled_targets=sigma_scaled_targets,
                 reference_sigma=reference_sigma,
+                bid_ask_spread_pct=bid_ask_spread_pct,
+                commission_per_contract=commission_per_contract,
             )
             r = bt.run(
                 ticker,
@@ -168,25 +172,32 @@ if __name__ == "__main__":
     panel = fetch_panel(tickers, years)
     print(f"  got {len(panel)} pairs\n")
 
-    print("A. Fixed-percent targets (15% / 8%)")
+    RETAIL_COSTS = dict(bid_ask_spread_pct=0.02, commission_per_contract=0.65)
+
+    print("A. Fixed-percent targets (15% / 8%), ZERO costs (theoretical mid)")
     df_fixed = run_walkforward(panel, sigma_scaled_targets=False)
-    _print_summary("fixed", summarize(df_fixed))
+    _print_summary("fixed/no-cost", summarize(df_fixed))
 
-    print("\nB. Sigma-scaled targets (base 15% / 8% at ref sigma=0.20)")
+    print("\nB. Fixed-percent targets, RETAIL costs (2% half-spread + $0.65/contract)")
+    df_fixed_cost = run_walkforward(panel, sigma_scaled_targets=False, **RETAIL_COSTS)
+    _print_summary("fixed/retail-cost", summarize(df_fixed_cost))
+
+    print("\nC. Sigma-scaled targets (15% / 8% at ref sigma=0.20), ZERO costs")
     df_scaled = run_walkforward(panel, sigma_scaled_targets=True, reference_sigma=0.20)
-    _print_summary("scaled", summarize(df_scaled))
+    _print_summary("scaled/no-cost", summarize(df_scaled))
 
-    print("\nPer-pair delta (scaled - fixed), worst and best:")
-    merged = df_fixed.merge(
-        df_scaled,
-        on=["ticker", "year", "side"],
-        suffixes=("_fixed", "_scaled"),
+    print("\nD. Sigma-scaled targets, RETAIL costs")
+    df_scaled_cost = run_walkforward(
+        panel, sigma_scaled_targets=True, reference_sigma=0.20, **RETAIL_COSTS,
     )
-    merged["pnl_delta"] = merged["total_pnl_scaled"] - merged["total_pnl_fixed"]
-    merged["sharpe_delta"] = merged["sharpe_scaled"] - merged["sharpe_fixed"]
-    print("  biggest scaled-vs-fixed improvements:")
-    for _, r in merged.sort_values("pnl_delta", ascending=False).head(5).iterrows():
-        print(f"    {r.ticker:<5} {r.year} {r.side:>4}: pnl {r.total_pnl_fixed:+7.2f} -> {r.total_pnl_scaled:+7.2f} ({r.pnl_delta:+6.2f}), sharpe {r.sharpe_fixed:+.2f} -> {r.sharpe_scaled:+.2f}")
-    print("  biggest scaled-vs-fixed regressions:")
+    _print_summary("scaled/retail-cost", summarize(df_scaled_cost))
+
+    print("\nCost impact at fixed targets (B − A) — worst regressions:")
+    merged = df_fixed.merge(
+        df_fixed_cost,
+        on=["ticker", "year", "side"],
+        suffixes=("_nocost", "_cost"),
+    )
+    merged["pnl_delta"] = merged["total_pnl_cost"] - merged["total_pnl_nocost"]
     for _, r in merged.sort_values("pnl_delta").head(5).iterrows():
-        print(f"    {r.ticker:<5} {r.year} {r.side:>4}: pnl {r.total_pnl_fixed:+7.2f} -> {r.total_pnl_scaled:+7.2f} ({r.pnl_delta:+6.2f}), sharpe {r.sharpe_fixed:+.2f} -> {r.sharpe_scaled:+.2f}")
+        print(f"    {r.ticker:<5} {r.year} {r.side:>4}: pnl {r.total_pnl_nocost:+7.2f} -> {r.total_pnl_cost:+7.2f} ({r.pnl_delta:+6.2f})")

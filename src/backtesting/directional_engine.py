@@ -33,6 +33,11 @@ except ImportError:
 
 SignalFn = Callable[[pd.DataFrame], Literal["buy_call", "buy_put", "hold"]]
 TRADING_DAYS_PER_YEAR = 252
+# Standard US listed option contract represents 100 shares of the underlying.
+# BS gives a per-share premium; commissions and dollar P&L scale by this.
+# The engine internally tracks per-share-equivalent dollars throughout, so
+# `commission_per_contract` is divided by this when added to a per-share cost.
+CONTRACT_MULTIPLIER = 100
 
 
 def rolling_realized_vol(
@@ -74,6 +79,8 @@ class DirectionalBacktester:
         max_hold_days: int = 10,
         sigma_scaled_targets: bool = False,
         reference_sigma: float = 0.20,
+        bid_ask_spread_pct: float = 0.0,
+        commission_per_contract: float = 0.0,
     ):
         self.r = risk_free_rate
         self.sigma = sigma  # constant fallback when no sigma_series is provided
@@ -90,6 +97,13 @@ class DirectionalBacktester:
         # come.
         self.sigma_scaled_targets = sigma_scaled_targets
         self.reference_sigma = reference_sigma
+        # Transaction-cost layer. `bid_ask_spread_pct` is the half-spread
+        # as a fraction of the BS mid — entries pay mid*(1+hs)+commission
+        # (the ask), exits and mark-to-market receive mid*(1-hs)-commission
+        # (the bid). Round-trip spread cost ≈ 2·hs of mid + 2 commissions.
+        # Defaults are 0 so existing callers see no behavior change.
+        self.bid_ask_spread_pct = bid_ask_spread_pct
+        self.commission_per_contract = commission_per_contract
 
     @staticmethod
     def _fetch_history(ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -103,8 +117,30 @@ class DirectionalBacktester:
     def _option_price(
         self, side: str, S: float, K: float, days_to_expiry: int, sigma: float
     ) -> float:
+        """BS mid (theoretical fair value)."""
         T = max(days_to_expiry / TRADING_DAYS_PER_YEAR, 1e-6)
         return black_scholes(S=S, K=K, T=T, r=self.r, sigma=sigma, option_type=side)
+
+    def _commission_per_share(self) -> float:
+        return self.commission_per_contract / CONTRACT_MULTIPLIER
+
+    def _ask_cost(
+        self, side: str, S: float, K: float, days_to_expiry: int, sigma: float
+    ) -> float:
+        """Effective per-share cost to OPEN: mid + half-spread + per-share
+        commission. (commission_per_contract is divided by the 100-share
+        contract multiplier so it lives in the same unit as BS premium.)"""
+        mid = self._option_price(side, S, K, days_to_expiry, sigma)
+        return mid * (1 + self.bid_ask_spread_pct) + self._commission_per_share()
+
+    def _bid_value(
+        self, side: str, S: float, K: float, days_to_expiry: int, sigma: float
+    ) -> float:
+        """Effective per-share value to CLOSE: mid - half-spread - per-share
+        commission. Also used for mark-to-market so unrealized P&L equals
+        what would be realized if the position were closed on this bar."""
+        mid = self._option_price(side, S, K, days_to_expiry, sigma)
+        return mid * (1 - self.bid_ask_spread_pct) - self._commission_per_share()
 
     def _open_position(
         self, signal: str, idx: int, spot: float, n_bars: int, sigma: float
@@ -117,7 +153,7 @@ class DirectionalBacktester:
         # lose theta because entry was priced at the full dte_days.
         expiry_idx = min(idx + self.dte_days, n_bars - 1)
         days_to_expiry = expiry_idx - idx
-        entry_price = self._option_price(side, spot, strike, days_to_expiry, sigma)
+        entry_price = self._ask_cost(side, spot, strike, days_to_expiry, sigma)
         return _OpenPosition(
             side=side,
             strike=strike,
@@ -135,12 +171,15 @@ class DirectionalBacktester:
         days_to_expiry = pos.expiry_idx - idx
 
         if days_to_expiry <= 0:
-            payoff = max(spot - pos.strike, 0) if pos.side == "call" else max(
+            intrinsic = max(spot - pos.strike, 0) if pos.side == "call" else max(
                 pos.strike - spot, 0
             )
-            return payoff, "expiry"
+            # Cash settlement has no spread, but the exit-side per-share
+            # commission still applies (matching the bid-value convention
+            # used below).
+            return intrinsic - self._commission_per_share(), "expiry"
 
-        current_price = self._option_price(
+        current_price = self._bid_value(
             pos.side, spot, pos.strike, days_to_expiry, pos.sigma_at_entry
         )
         pnl_pct = (current_price - pos.entry_price) / pos.entry_price
@@ -231,7 +270,7 @@ class DirectionalBacktester:
                     last_mark = 0.0
                 else:
                     days_to_expiry = position.expiry_idx - i
-                    current_price = self._option_price(
+                    current_price = self._bid_value(
                         position.side,
                         spot,
                         position.strike,
